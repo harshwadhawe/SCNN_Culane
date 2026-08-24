@@ -22,7 +22,11 @@ Prefix with `.venv/bin/python` or `source .venv/bin/activate` first.
 prob2lines → evaluation) in small cells with inline figures. It runs against a real dataset when
 `config.py` points at one, and otherwise writes a toy dataset in CULane's on-disk format under
 `toy_data/` so every cell still exercises the real code path. It uses `experiments/exp_notebook/`
-as its exp_dir, leaving `exp0`/`exp10` alone. All hardware branching is confined to the `RUNTIME`
+as its exp_dir, leaving `exp0`/`exp10` alone.
+
+`scnn_tusimple_colab.ipynb` is the Colab/A100 path: it clones the repo, fetches TuSimple to local
+disk (never a mounted Drive — per-epoch JPEG reads dominate otherwise), and drives
+`scnn_tusimple.py` rather than reimplementing the loop. All hardware branching is confined to the `RUNTIME`
 dict in section 0 (batch size, workers, `pin_memory`, AMP, DataParallel); CUDA and MPS/CPU differ
 only there. Note `Subset` does not forward `.collate`, so its loaders use `Dataset_Type.collate`.
 
