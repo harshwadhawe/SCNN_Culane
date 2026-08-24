@@ -40,9 +40,14 @@ class SCNN(nn.Module):
         exist_pred = self.fc(x)
 
         if seg_gt is not None and exist_gt is not None:
-            loss_seg = self.ce_loss(seg_pred, seg_gt)
-            loss_exist = self.bce_loss(exist_pred, exist_gt)
-            loss = loss_seg * self.scale_seg + loss_exist * self.scale_exist
+            # self.fc already applies Sigmoid, so this is BCELoss-on-probabilities, which
+            # CUDA autocast refuses ("unsafe to autocast"). Cross-entropy on fp16 logits is
+            # also less stable. Compute both in fp32 with autocast explicitly off -- a no-op
+            # when autocast was never enabled, so the fp32 path is bit-identical.
+            with torch.autocast(device_type=img.device.type, enabled=False):
+                loss_seg = self.ce_loss(seg_pred.float(), seg_gt)
+                loss_exist = self.bce_loss(exist_pred.float(), exist_gt.float())
+                loss = loss_seg * self.scale_seg + loss_exist * self.scale_exist
         else:
             loss_seg = torch.tensor(0, dtype=img.dtype, device=img.device)
             loss_exist = torch.tensor(0, dtype=img.dtype, device=img.device)

@@ -73,16 +73,18 @@ def describe(device):
 def autoscale_batch(device, resize, amp):
     """Fit the batch to VRAM.
 
-    Measured on this model: 381 MB of activations per image at 512x288 in fp32.
-    Autocast roughly halves that. Scale linearly with pixel count, keep headroom
-    for the CUDA context, weights and optimizer state.
+    Calibrated against an RTX 4060 (7799 MiB): batch 26 at 512x288 with autocast
+    OOMs, implying ~287 MB per image. Autocast saves roughly 30% over fp32 rather
+    than half -- fp32 master weights and cuDNN workspace do not shrink. Scale
+    linearly with pixel count and keep headroom for context, weights, SGD momentum
+    and cudnn.benchmark's algorithm search.
     """
     if device.type != "cuda":
         return 4
     total_mb = torch.cuda.get_device_properties(0).total_memory / 2**20
     px_ratio = (resize[0] * resize[1]) / (512 * 288)
-    per_img = (215 if amp else 381) * px_ratio
-    usable = total_mb * 0.80 - 600           # context + weights + optimizer + fragmentation
+    per_img = (300 if amp else 430) * px_ratio
+    usable = total_mb * 0.85 - 800           # context + weights + optimizer + cudnn workspace
     return int(max(2, min(32, usable // per_img)))
 
 
@@ -280,9 +282,11 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
             except torch.cuda.OutOfMemoryError:
-                log(f"CUDA OOM at batch {args.batch_size}. Rerun with a smaller batch, e.g.\n"
-                    f"  --batch-size {max(2, args.batch_size // 2)}"
-                    + ("  --amp" if not args.amp else ""))
+                b = max(2, int(args.batch_size * 0.7))
+                log(f"CUDA OOM at batch {args.batch_size}. Rerun with:\n"
+                    f"  --batch-size {b} --max-iter {int(args.max_iter * args.batch_size / b)}"
+                    + ("  --amp" if not args.amp else "")
+                    + "\n(the larger --max-iter keeps the same number of images seen)")
                 sys.exit(2)
             sched.step()
 
