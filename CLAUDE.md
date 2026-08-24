@@ -22,7 +22,9 @@ Prefix with `.venv/bin/python` or `source .venv/bin/activate` first.
 prob2lines → evaluation) in small cells with inline figures. It runs against a real dataset when
 `config.py` points at one, and otherwise writes a toy dataset in CULane's on-disk format under
 `toy_data/` so every cell still exercises the real code path. It uses `experiments/exp_notebook/`
-as its exp_dir, leaving `exp0`/`exp10` alone.
+as its exp_dir, leaving `exp0`/`exp10` alone. All hardware branching is confined to the `RUNTIME`
+dict in section 0 (batch size, workers, `pin_memory`, AMP, DataParallel); CUDA and MPS/CPU differ
+only there. Note `Subset` does not forward `.collate`, so its loaders use `Dataset_Type.collate`.
 
 The three README checkpoints are downloaded (`gdown`, ids in the notebook's `PUBLISHED` dict) and
 all load with `strict=True`: `experiments/vgg_SCNN_DULR_w9/vgg_SCNN_DULR_w9.pth` (official CULane
@@ -32,6 +34,15 @@ conversion, 800×288), `experiments/exp10/exp10_best.pth` (CULane, 800×288),
 `demo/demo_result.jpg` exactly.
 
 ```bash
+# TuSimple: fetch (Kaggle; the old S3 links are 404) then train under tmux
+python download_tusimple.py --dest /data/tusimple      # or --from-zip <already-downloaded.zip>
+python download_tusimple.py --dest /data/tusimple --verify-only
+python scnn_tusimple.py --data /data/tusimple --exp-dir experiments/tusimple [--resume|--eval-only]
+
+# fetch CULane (~55GB unpacked, resumable; ids verified against the official Drive folder)
+python download_culane.py --list                          # plan only
+python download_culane.py --dest /path/to/CULane          # everything SCNN needs
+
 # train (reads experiments/<exp>/cfg.json, writes checkpoint + tensorboard there)
 python train.py --exp_dir ./experiments/exp0 [--resume/-r]
 tensorboard --logdir='experiments/exp0'
@@ -75,4 +86,7 @@ There is no test suite and no linter. `test_*.py` at the repo root are inference
 - `utils/prob2lines/` and `utils/lane_evaluation/tusimple/` have no `__init__.py` and rely on Python 3 namespace packages; scripts must be run from the repo root.
 - `utils/lane_evaluation/CULane/src/` is the multithreaded evaluator and is what `CMakeLists.txt` builds; `src_origin/` is the unmodified upstream single-threaded version, kept for reference and not compiled.
 - `utils/tensorboard.py` imports `tensorflow` and `scipy.misc` (removed from scipy years ago) — it does **not** run on a modern stack. `train.py` imports it at module scope, so training as written needs that file replaced or stubbed.
+- `scnn_tusimple.py` is the unattended path (CUDA/MPS/CPU picked at runtime, VRAM-scaled batch, AMP on CUDA, signal-safe checkpointing, resume). It deliberately avoids `utils/tensorboard.py`. `utils/lane_evaluation/tusimple/lane.py` needs `scikit-learn`, which is not in requirements.txt.
+- `_LRScheduler.state_dict()` persists **every** attribute, so `load_state_dict` restores the old run's `max_iter`/`warmup`/`base_lrs`. Resuming with a longer schedule needs them reapplied afterwards or the LR sits pinned at `min_lrs`.
+- `dataset/Tusimple.py:_gen_label_for_json` assumes `raw_file` is exactly `clips/<date>/<clip>/20.jpg` (4 components) and runs for train/val/**test**, so `test_label.json` must be present or instantiation crashes.
 - Training hardcodes `torch.nn.DataParallel` and `num_workers=8`; adjust for single-GPU or CPU machines.
