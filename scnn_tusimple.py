@@ -66,7 +66,11 @@ def describe(device):
     if device.type == "cuda":
         pr = torch.cuda.get_device_properties(0)
         n = torch.cuda.device_count()
-        return f"cuda: {pr.name}, {pr.total_memory/2**30:.1f} GiB" + (f" x{n}" if n > 1 else "")
+        free, total = (v / 2**30 for v in torch.cuda.mem_get_info(0))
+        used = total - free
+        warn = "  <-- something else is using the GPU" if used > 0.5 else ""
+        return (f"cuda: {pr.name}, {total:.1f} GiB total, {free:.1f} GiB free "
+                f"({used:.1f} GiB already in use){warn}" + (f" x{n}" if n > 1 else ""))
     return f"{device.type}: no dedicated VRAM limit tracked"
 
 
@@ -81,10 +85,13 @@ def autoscale_batch(device, resize, amp):
     """
     if device.type != "cuda":
         return 4
-    total_mb = torch.cuda.get_device_properties(0).total_memory / 2**20
+    # mem_get_info gives what is actually free right now, not the card's capacity --
+    # anything else resident on the GPU (another job, a stale process, the desktop)
+    # has to come off the top or every estimate overcommits.
+    free_mb = torch.cuda.mem_get_info(0)[0] / 2**20
     px_ratio = (resize[0] * resize[1]) / (512 * 288)
     per_img = (300 if amp else 430) * px_ratio
-    usable = total_mb * 0.85 - 800           # context + weights + optimizer + cudnn workspace
+    usable = free_mb * 0.85 - 800            # context + weights + optimizer + cudnn workspace
     return int(max(2, min(32, usable // per_img)))
 
 
