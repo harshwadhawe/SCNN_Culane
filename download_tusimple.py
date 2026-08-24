@@ -32,24 +32,49 @@ LABELS = ["label_data_0313.json", "label_data_0531.json", "label_data_0601.json"
 TEST_ALIASES = ["test_label.json", "test_label_new.json", "test_tasks_0627.json"]
 
 
-def merge_into(src: Path, dst: Path):
-    """Move src's entries into dst, merging directories instead of clobbering."""
+def merge_into(src: Path, dst: Path, stats=None):
+    """Move src's entries into dst, merging directories instead of clobbering.
+
+    Returns the number of files left behind because the destination already had
+    that name -- nothing is ever overwritten.
+    """
+    stats = {"kept": 0} if stats is None else stats
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         target = dst / item.name
         if item.is_dir() and target.exists():
-            merge_into(item, target)
-            item.rmdir() if not any(item.iterdir()) else None
+            merge_into(item, target, stats)
+            if not any(item.iterdir()):
+                item.rmdir()
         elif not target.exists():
             shutil.move(str(item), str(target))
+        else:
+            stats["kept"] += 1          # same name on both sides; leave the original alone
+    return stats["kept"]
 
 
 def normalise(staging: Path, dest: Path):
     """Pull clips/ and the label json files out of however Kaggle nested them."""
     for clips in sorted(staging.rglob("clips")):
         if clips.is_dir() and clips.resolve() != (dest / "clips").resolve():
-            print(f"  merge {clips.relative_to(staging)} -> clips/")
-            merge_into(clips, dest / "clips")
+            collisions = merge_into(clips, dest / "clips")
+            print(f"  merge {clips.relative_to(staging)} -> clips/"
+                  + (f"  ({collisions} files already present, originals kept)" if collisions else ""))
+    for seg in sorted(staging.rglob("seg_label")):
+        if not seg.is_dir() or seg.resolve() == (dest / "seg_label").resolve():
+            continue
+        if (dest / "seg_label").exists():
+            break
+        if (seg / "list" / "train_gt.txt").exists():
+            print(f"  keep  {seg.relative_to(staging)} -> seg_label/  (skips label generation)")
+            shutil.move(str(seg), str(dest / "seg_label"))
+        else:
+            alt = dest / "seg_label_prebuilt"
+            print(f"  note  {seg.relative_to(staging)} has no list/train_gt.txt; parking it at "
+                  f"{alt.name}/ so dataset/Tusimple.py regenerates its own")
+            shutil.move(str(seg), str(alt))
+        break
+
     for name in LABELS[:3]:
         for found in staging.rglob(name):
             if not (dest / name).exists():
@@ -126,9 +151,14 @@ def main():
         normalise(dest, dest)
         for leftover in ("train_set", "test_set", "_staging"):
             d = dest / leftover
-            if d.is_dir() and not any(d.rglob("*.jpg")):
+            if not d.is_dir():
+                continue
+            files = [f for f in d.rglob("*") if f.is_file()]
+            if not files:
                 shutil.rmtree(d, ignore_errors=True)
                 print(f"  removed empty {leftover}/")
+            else:
+                print(f"  left {leftover}/ in place ({len(files)} files remain, e.g. {files[0].name})")
         print("verifying")
         ok = verify(dest)
         if ok:
