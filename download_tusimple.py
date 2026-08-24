@@ -27,6 +27,9 @@ from pathlib import Path
 
 KAGGLE_DS = "manideep1108/tusimple"
 LABELS = ["label_data_0313.json", "label_data_0531.json", "label_data_0601.json", "test_label.json"]
+# Kaggle ships the test ground truth as test_label_new.json; dataset/Tusimple.py hardcodes
+# TEST_SET = ['test_label.json'], so whichever we find gets normalised to that name.
+TEST_ALIASES = ["test_label.json", "test_label_new.json", "test_tasks_0627.json"]
 
 
 def merge_into(src: Path, dst: Path):
@@ -44,15 +47,22 @@ def merge_into(src: Path, dst: Path):
 def normalise(staging: Path, dest: Path):
     """Pull clips/ and the label json files out of however Kaggle nested them."""
     for clips in sorted(staging.rglob("clips")):
-        if clips.is_dir():
+        if clips.is_dir() and clips.resolve() != (dest / "clips").resolve():
             print(f"  merge {clips.relative_to(staging)} -> clips/")
             merge_into(clips, dest / "clips")
-    for name in LABELS:
+    for name in LABELS[:3]:
         for found in staging.rglob(name):
             if not (dest / name).exists():
                 print(f"  take  {found.relative_to(staging)}")
                 shutil.move(str(found), str(dest / name))
             break
+    if not (dest / "test_label.json").exists():
+        for alias in TEST_ALIASES:
+            found = next(staging.rglob(alias), None)
+            if found is not None:
+                print(f"  take  {found.relative_to(staging)} -> test_label.json")
+                shutil.move(str(found), str(dest / "test_label.json"))
+                break
 
 
 def verify(dest: Path) -> bool:
@@ -80,11 +90,56 @@ def main():
     ap.add_argument("--from-zip", nargs="*", type=Path, default=None,
                     help="use these local zips instead of downloading from Kaggle")
     ap.add_argument("--verify-only", action="store_true")
+    ap.add_argument("--arrange", action="store_true",
+                    help="flatten an already-extracted tree in place (Kaggle nests the data "
+                         "under train_set/ and test_set/; the repo needs one clips/ at the root)")
+    ap.add_argument("--inspect", action="store_true",
+                    help="show what is already under --dest and exit, changing nothing")
+    ap.add_argument("--test-label", type=Path, default=None,
+                    help="copy this file in as test_label.json (Kaggle names it test_label_new.json "
+                         "and may leave it outside the dataset directory)")
     ap.add_argument("--keep-staging", action="store_true")
     args = ap.parse_args()
 
     dest = args.dest.expanduser().resolve()
     dest.mkdir(parents=True, exist_ok=True)
+
+    if args.inspect:
+        print(f"{dest}")
+        for child in sorted(dest.iterdir())[:20]:
+            kind = "dir " if child.is_dir() else f"{child.stat().st_size/1e6:.1f}MB"
+            print(f"  {kind:>8}  {child.name}")
+            if child.is_dir() and child.name != "clips":
+                for g in sorted(child.iterdir())[:10]:
+                    gk = "dir " if g.is_dir() else f"{g.stat().st_size/1e6:.1f}MB"
+                    print(f"      {gk:>8}  {child.name}/{g.name}")
+        for sub_ in sorted(dest.rglob("clips")):
+            dates = sorted(d.name for d in sub_.iterdir() if d.is_dir())
+            print(f"  clips at {sub_.relative_to(dest)}: {dates[:6]}{' ...' if len(dates) > 6 else ''}")
+        for alias in TEST_ALIASES:
+            for hit in list(dest.rglob(alias))[:3]:
+                print(f"  test label: {hit.relative_to(dest)}")
+        sys.exit(0)
+
+    if args.arrange:
+        print(f"arranging {dest} in place")
+        normalise(dest, dest)
+        for leftover in ("train_set", "test_set", "_staging"):
+            d = dest / leftover
+            if d.is_dir() and not any(d.rglob("*.jpg")):
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"  removed empty {leftover}/")
+        print("verifying")
+        ok = verify(dest)
+        if ok:
+            n = sum(1 for _ in (dest / "clips").rglob("20.jpg"))
+            print(f"\nready: {n} labelled frames under {dest}")
+        sys.exit(0 if ok else 1)
+
+    if args.test_label is not None:
+        src = args.test_label.expanduser().resolve()
+        print(f"install {src.name} -> {dest/'test_label.json'}")
+        shutil.copyfile(src, dest / "test_label.json")
 
     if args.verify_only:
         sys.exit(0 if verify(dest) else 1)
