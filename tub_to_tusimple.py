@@ -270,7 +270,8 @@ def main():
     print(f"\nkept {kept}, dropped {dropped} ({100*dropped/max(kept+dropped,1):.1f}% no centre line)")
     for n in sorted(found):
         print(f"  {n} lane(s) labelled on {found[n]} frames")
-    print(f"train with:\n  python scnn_tusimple.py --data {dest} --resize 128 128")
+    print(f"train with:\n  python scnn_tusimple.py --data {dest} --resize 512 288 \\\\\n        --init-from experiments/tusimple/best.pth --lr 0.01")
+    print("  (512x288 keeps SCNN's message passing at 36x64 slices and lets every\n         tensor transfer; 128x128 shrinks it to 16x16 and drops fc.0)")
 
 
 if __name__ == "__main__":

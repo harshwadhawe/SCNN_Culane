@@ -49,6 +49,11 @@ def parse_args():
                         "sequential steps and overflows fp16. Ampere and later already get "
                         "tensor cores through TF32, without the range loss.")
     p.add_argument("--log-every", type=int, default=20, help="iterations between progress lines")
+    p.add_argument("--init-from", type=Path, default=None,
+                   help="fine-tune: take model weights from this checkpoint and start a "
+                        "fresh run. Unlike --resume the optimiser and LR schedule restart. "
+                        "Tensors whose shape does not match are left at their init -- only "
+                        "fc.0 does, and only when --resize differs from the source run.")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="skip training, score the best checkpoint")
     p.add_argument("--no-eval", action="store_true", help="train only, skip the final LaneEval")
@@ -242,6 +247,21 @@ def main():
 
     latest, best_path = args.exp_dir / "latest.pth", args.exp_dir / "best.pth"
     start_epoch, best_val = 0, float("inf")
+
+    if args.init_from is not None and not args.resume:
+        ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        src = ck.get("net", ck)
+        tgt = core.state_dict()
+        # Everything up to the existence head is fully convolutional and transfers at any
+        # input size. fc.0 is sized by fc_input_feature = 5*(W/16)*(H/16), so it only
+        # matches when fine-tuning at the resolution the source was trained at.
+        take = {k: v for k, v in src.items() if k in tgt and tgt[k].shape == v.shape}
+        skipped = [k for k in src if k not in take]
+        core.load_state_dict(take, strict=False)
+        log(f"init from {args.init_from}: {len(take)}/{len(tgt)} tensors loaded"
+            + (f"; {len(skipped)} left at init ({', '.join(skipped)})" if skipped else ""))
+    elif args.init_from is not None:
+        log("--resume takes precedence over --init-from; loading this run's own checkpoint")
 
     if args.resume or args.eval_only:
         ckpt_path = best_path if args.eval_only else latest
