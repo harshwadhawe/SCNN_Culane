@@ -163,8 +163,20 @@ def validate(net, loader, device, amp):
 
 
 def run_eval(net, loader, device, amp, exp_dir, data_root, log):
-    """Inference -> predict_test.json -> LaneEval, mirroring test_tusimple.py."""
+    """Inference -> predict_test.json -> LaneEval, mirroring test_tusimple.py.
+
+    LaneEval scores against TuSimple's own test_label.json. A dataset built by
+    tub_to_tusimple.py carries segmentation labels but no such file, so there is
+    nothing to score against -- say so and skip, rather than dying after the
+    training run has already finished.
+    """
     from utils.lane_evaluation.tusimple.lane import LaneEval   # needs scikit-learn
+
+    gt = Path(data_root) / "test_label.json"
+    if not gt.exists():
+        log(f"no {gt.name} under {data_root}; skipping LaneEval. That file is "
+            "TuSimple's ground truth, not something a training run produces.")
+        return None
 
     net.eval()
     out_dir = exp_dir / "coord_output"
