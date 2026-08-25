@@ -32,33 +32,39 @@ FRAME_W, FRAME_H = 128, 120
 # track the line sits at H~25 S>120 V~250 while grass and dirt sit at H~30 V~139.
 # The notebook's [20,60,80] floor lets the shoulder through, and "widest run per row"
 # then locks onto grass instead of the line.
-YELLOW_LOWER = np.array([18, 80, 170])
+# Saturation and value separate the centre line from the shoulder, not hue: the line
+# sits at H~25 S>120 V~250, grass and dirt at H~30 V~139. The notebook's [20,60,80]
+# floor lets the shoulder through and "widest run per row" then locks onto grass.
+# Looser floors buy coverage by losing precision -- measured against the painted
+# pixels: [18,80,170] 84% of frames at 0.57, [18,70,150] 91% at 0.48, [18,60,130]
+# collapses to 28%.
+YELLOW_LOWER = np.array([18, 70, 150])
 YELLOW_UPPER = np.array([42, 255, 255])
+
+# Edge lines: bright and unsaturated. Found on only ~40% of frames, but 0.9 precision
+# when found, so worth labelling with a per-lane existence flag rather than dropping.
+WHITE_LOWER = np.array([0, 0, 205])
+WHITE_UPPER = np.array([180, 45, 255])
 
 ROAD_TOP = 50               # first row below the horizon
 MIN_ROWS = 6                # fewer rows than this and the line is too short to trust
 MAX_RESID = 4.0             # px RMS; a worse fit means the tracker wandered off the line
 SEG_WIDTH = 4               # drawn line thickness in source pixels
+LANE_NAMES = ("white_left", "yellow", "white_right")     # segmentation classes 1, 2, 3
 
 
-def yellow_points(bgr):
-    """Row-wise centroid of the yellow centre line, fitted and resampled.
-
-    Works directly in image space. The bird's-eye warp the notebook uses is tuned
-    for a different tub: on this one it pushes the line outside the warp quad on
-    ~21% of frames, which shows up as an empty mask even though the line is plainly
-    visible in the source.
-    """
-    mask = cv2.medianBlur(cv2.inRange(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV),
-                                      YELLOW_LOWER, YELLOW_UPPER), 3)
+def _fit_rows(mask, pick):
+    """Per-row pick -> polynomial fit -> resampled points, or None."""
     xs, ys = [], []
     for y in range(ROAD_TOP, FRAME_H):
         idx = np.flatnonzero(mask[y] > 0)
         if idx.size == 0:
             continue
         runs = np.split(idx, np.flatnonzero(np.diff(idx) > 3) + 1)
-        widest = max(runs, key=len)
-        xs.append(widest.mean()); ys.append(y)
+        run = pick(runs, y)
+        if run is None or len(run) == 0:
+            continue
+        xs.append(run.mean()); ys.append(y)
 
     if len(xs) < MIN_ROWS:
         return None
@@ -66,18 +72,71 @@ def yellow_points(bgr):
     fit = np.polyfit(ys, xs, 2 if len(xs) >= 5 else 1)
     if np.sqrt(np.mean((np.polyval(fit, ys) - xs) ** 2)) > MAX_RESID:
         return None
-
     yy = np.arange(ys.min(), FRAME_H)                 # extend the fit down to the bumper
     pts = np.stack([np.polyval(fit, yy), yy], axis=1)
     return pts[(pts[:, 0] >= 0) & (pts[:, 0] < FRAME_W)]
 
 
-def draw_mask(pts):
-    """Source-resolution segmentation mask, centre line as class 1."""
+def extract_lanes(bgr):
+    """-> {lane name: points}. Detected in image space, row by row.
+
+    The bird's-eye warp the notebook uses is tuned for a different tub; here it
+    pushes the centre line outside the quad on ~21% of frames, and tracking the
+    column histogram inside it lands on road texture rather than paint -- 0.31-0.39
+    precision against the painted pixels, versus 0.57 for this.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    ymask = cv2.medianBlur(cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER), 3)
+    ypts = _fit_rows(ymask, lambda runs, y: max(runs, key=len))
+    if ypts is None:
+        return {}                                     # no centre line, no anchor
+    lanes = {"yellow": ypts}
+
+    # Edge lines are keyed off the centre line, so a class always means the same
+    # marking however the car is placed across the track.
+    centre = {int(y): x for x, y in ypts}
+    wmask = cv2.medianBlur(cv2.inRange(hsv, WHITE_LOWER, WHITE_UPPER), 3)
+    for name, sign in (("white_left", -1), ("white_right", 1)):
+        def pick(runs, y, sign=sign):
+            cx = centre.get(y)
+            if cx is None:
+                return None
+            side = [r for r in runs if (r.mean() - cx) * sign > 4]
+            return max(side, key=len) if side else None
+        pts = _fit_rows(wmask, pick)
+        if pts is not None and _stays_on_side(pts, centre, sign):
+            lanes[name] = pts
+    return lanes
+
+
+def _stays_on_side(pts, centre, sign, min_gap=3.0, tolerance=0.9):
+    """Reject an edge that crosses the centre line -- real markings never do.
+
+    The per-row pick only sees one row at a time, so where there is no edge on that
+    side it will happily follow road glare, and a smooth wrong curve passes the
+    residual test. Checking the fitted curve against the centre line catches it.
+    """
+    shared = [(x, centre[int(y)]) for x, y in pts if int(y) in centre]
+    if len(shared) < MIN_ROWS:
+        return False
+    ok = sum(1 for x, cx in shared if (x - cx) * sign >= min_gap)
+    return ok / len(shared) >= tolerance
+
+
+def draw_mask(lanes):
+    """Source-resolution mask. Classes follow LANE_NAMES: 1 left, 2 centre, 3 right.
+
+    Written here rather than through Tusimple.generate_label(), which assigns a lane
+    to class 2 or 3 by its slope -- that would flip a single centre line between
+    classes as the track curves.
+    """
     seg = np.zeros((FRAME_H, FRAME_W), np.uint8)
-    order = pts[np.argsort(-pts[:, 1])]                               # bottom of frame upward
-    ipts = np.round(order).astype(np.int32)
-    cv2.polylines(seg, [ipts], False, 1, SEG_WIDTH)
+    for cls, name in enumerate(LANE_NAMES, start=1):
+        pts = lanes.get(name)
+        if pts is None or len(pts) < 2:
+            continue
+        order = pts[np.argsort(-pts[:, 1])]                           # bottom of frame upward
+        cv2.polylines(seg, [np.round(order).astype(np.int32)], False, cls, SEG_WIDTH)
     return seg
 
 
@@ -87,11 +146,17 @@ def main():
     ap.add_argument("--tub", required=True, type=Path)
     ap.add_argument("--dest", required=True, type=Path)
     ap.add_argument("--limit", type=int, default=None, help="only the first N frames (for a trial run)")
+    ap.add_argument("--yellow-sv", type=int, nargs=2, metavar=("S", "V"), default=None,
+                    help="saturation and value floor for the centre line "
+                         "(default 70 150; 80 170 is stricter and more precise)")
     ap.add_argument("--val-episodes", type=int, default=2, help="whole episodes held out for val")
     ap.add_argument("--test-episodes", type=int, default=1)
     ap.add_argument("--preview", action="store_true", help="write preview.png and stop")
     ap.add_argument("--preview-n", type=int, default=12, help="frames to show in the preview")
     args = ap.parse_args()
+
+    if args.yellow_sv:
+        YELLOW_LOWER[1], YELLOW_LOWER[2] = args.yellow_sv
 
     tub, dest = args.tub.expanduser().resolve(), args.dest.expanduser().resolve()
     telem = {r["frame"]: r for r in csv.DictReader(open(tub / "telemetry.csv"))}
@@ -106,9 +171,14 @@ def main():
         tiles, hit = [], 0
         for p in picks:
             bgr = cv2.imread(str(p)); vis = bgr.copy()
-            pts = yellow_points(bgr)
-            if pts is not None:
-                vis[draw_mask(pts) == 1] = (0, 255, 255); hit += 1
+            lanes = extract_lanes(bgr)
+            if lanes:
+                seg = draw_mask(lanes)
+                for cls, col in enumerate([(255, 80, 80), (0, 255, 255), (80, 80, 255)], start=1):
+                    vis[seg == cls] = col
+                hit += 1
+                cv2.putText(vis, "".join("1" if n in lanes else "0" for n in LANE_NAMES),
+                            (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
             else:
                 cv2.putText(vis, "no line", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
             pair = np.hstack([cv2.resize(bgr, (192, 180), interpolation=cv2.INTER_NEAREST),
@@ -157,12 +227,13 @@ def main():
 
     (dest / "seg_label" / "list").mkdir(parents=True, exist_ok=True)
     lists, kept, dropped = defaultdict(list), 0, 0
+    found = defaultdict(int)
 
     for ep in eps:
         for p in by_ep[ep]:
             bgr = cv2.imread(str(p))
-            pts = None if bgr is None else yellow_points(bgr)
-            if pts is None:
+            lanes = {} if bgr is None else extract_lanes(bgr)
+            if not lanes:
                 dropped += 1
                 continue
             stem = p.stem
@@ -172,12 +243,14 @@ def main():
                 (dest / rel).parent.mkdir(parents=True, exist_ok=True)
             if not (dest / rel_img).exists():
                 shutil.copyfile(p, dest / rel_img)
-            cv2.imwrite(str(dest / rel_seg), draw_mask(pts))
+            cv2.imwrite(str(dest / rel_seg), draw_mask(lanes))
             split = split_of(p, ep)
             if split is None:
                 dropped += 1
                 continue
-            lists[split].append(f"/{rel_img} /{rel_seg} 1 0 0 0")
+            flags = " ".join("1" if n in lanes else "0" for n in LANE_NAMES) + " 0"
+            lists[split].append(f"/{rel_img} /{rel_seg} {flags}")
+            found[len(lanes)] += 1
             kept += 1
 
     for split, rows in lists.items():
@@ -185,6 +258,8 @@ def main():
         print(f"  {split:<6} {len(rows)} frames")
 
     print(f"\nkept {kept}, dropped {dropped} ({100*dropped/max(kept+dropped,1):.1f}% no centre line)")
+    for n in sorted(found):
+        print(f"  {n} lane(s) labelled on {found[n]} frames")
     print(f"train with:\n  python scnn_tusimple.py --data {dest} --resize 128 128")
 
 
