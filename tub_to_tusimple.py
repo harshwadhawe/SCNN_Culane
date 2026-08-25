@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--val-episodes", type=int, default=2, help="whole episodes held out for val")
     ap.add_argument("--test-episodes", type=int, default=1)
     ap.add_argument("--preview", action="store_true", help="write preview.png and stop")
+    ap.add_argument("--preview-n", type=int, default=12, help="frames to show in the preview")
     args = ap.parse_args()
 
     tub, dest = args.tub.expanduser().resolve(), args.dest.expanduser().resolve()
@@ -100,17 +101,24 @@ def main():
     print(f"{len(frames)} frames, {len({r['episode_id'] for r in telem.values()})} episodes")
 
     if args.preview:
-        picks = frames[::max(1, len(frames) // 6)][:6]
-        tiles = []
+        n = args.preview_n
+        picks = frames[::max(1, len(frames) // n)][:n]
+        tiles, hit = [], 0
         for p in picks:
             bgr = cv2.imread(str(p)); vis = bgr.copy()
             pts = yellow_points(bgr)
             if pts is not None:
-                vis[draw_mask(pts) == 1] = (0, 255, 255)
-            tiles.append(np.hstack([cv2.resize(bgr, (256, 240), interpolation=cv2.INTER_NEAREST),
-                                    cv2.resize(vis, (256, 240), interpolation=cv2.INTER_NEAREST)]))
-        cv2.imwrite("preview.png", np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])]))
-        print("wrote preview.png")
+                vis[draw_mask(pts) == 1] = (0, 255, 255); hit += 1
+            else:
+                cv2.putText(vis, "no line", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+            pair = np.hstack([cv2.resize(bgr, (192, 180), interpolation=cv2.INTER_NEAREST),
+                              cv2.resize(vis, (192, 180), interpolation=cv2.INTER_NEAREST)])
+            tiles.append(cv2.copyMakeBorder(pair, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=(60, 60, 60)))
+        per_row = 3
+        rows = [np.hstack(tiles[i:i + per_row]) for i in range(0, len(tiles), per_row)]
+        rows = [r for r in rows if r.shape[1] == rows[0].shape[1]]
+        cv2.imwrite("preview.png", np.vstack(rows))
+        print(f"wrote preview.png  ({hit}/{len(picks)} frames labelled, spread over the run)")
         return
 
     by_ep = defaultdict(list)
