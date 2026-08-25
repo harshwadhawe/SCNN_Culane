@@ -128,6 +128,45 @@ def link_from(src: Path, dest: Path):
     print(f"  {linked} clip directories linked")
 
 
+def export_slim(dest: Path, out: Path):
+    """Copy only what SCNN reads: the frames the labels reference, plus the labels.
+
+    The Kaggle archive is ~13 GB because it ships all 20 frames of every clip, but
+    only frame 20 is annotated -- 6408 images, ~1.8 GB. Small enough to park on
+    Drive and re-copy into each Colab session instead of re-downloading 13 GB.
+    seg_label/ comes along when present so the slow first-run generation is skipped.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    copied = missing = 0
+    for name in LABELS:
+        src_label = dest / name
+        if not src_label.exists():
+            continue
+        shutil.copyfile(src_label, out / name)
+        for line in src_label.read_text().splitlines():
+            if not line.strip():
+                continue
+            rel = json.loads(line)["raw_file"]
+            src, dst = dest / rel, out / rel
+            if not src.exists():
+                missing += 1
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                shutil.copyfile(src, dst)      # resolves symlinks, giving real files
+            copied += 1
+        print(f"  {name}: {copied} frames so far")
+
+    seg = dest / "seg_label"
+    if seg.is_dir():
+        print("  copying seg_label/ (skips regeneration on the other machine)")
+        shutil.copytree(seg, out / "seg_label", dirs_exist_ok=True)
+
+    size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
+    print(f"\nexported {copied} frames ({missing} missing) -> {out}  [{size/2**30:.2f} GiB]")
+    return missing == 0
+
+
 def count_frames(dest: Path) -> int:
     """Frames the labels actually reference. rglob("20.jpg") would undercount to zero
     on a symlinked tree, since Path.rglob does not descend into symlinked directories."""
@@ -164,6 +203,9 @@ def main():
     ap.add_argument("--from-zip", nargs="*", type=Path, default=None,
                     help="use these local zips instead of downloading from Kaggle")
     ap.add_argument("--verify-only", action="store_true")
+    ap.add_argument("--export", type=Path, default=None,
+                    help="write a slim copy holding only the frames the labels "
+                         "reference (~1.8 GB vs ~13 GB), for moving between machines")
     ap.add_argument("--link-from", type=Path, default=None,
                     help="build the tree as symlinks into a read-only source "
                          "(Kaggle's /kaggle/input); --dest must be writable")
@@ -197,6 +239,9 @@ def main():
             for hit in list(dest.rglob(alias))[:3]:
                 print(f"  test label: {hit.relative_to(dest)}")
         sys.exit(0)
+
+    if args.export is not None:
+        sys.exit(0 if export_slim(dest, args.export.expanduser().resolve()) else 1)
 
     if args.link_from is not None:
         src = args.link_from.expanduser().resolve()
