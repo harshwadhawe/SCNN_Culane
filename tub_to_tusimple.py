@@ -27,61 +27,49 @@ import cv2
 import numpy as np
 
 FRAME_W, FRAME_H = 128, 120
-SRC = np.float32([(42, 60), (-10, 104), (82, 60), (134, 104)])
-WARP_W = WARP_H = 160
-DST = np.float32([[0, 0], [0, WARP_H], [WARP_W, 0], [WARP_W, WARP_H]])
-M = cv2.getPerspectiveTransform(SRC, DST)
-M_INV = cv2.getPerspectiveTransform(DST, SRC)
 
-YELLOW_LOWER, YELLOW_UPPER = np.array([20, 60, 80]), np.array([40, 255, 255])
-WIN_H, WIN_MARGIN, N_WINDOWS = 16, 25, 10
-MIN_POINTS = 4              # fewer than this and the fit is not trustworthy
+# Saturation and value separate the centre line from the shoulder, not hue: on this
+# track the line sits at H~25 S>120 V~250 while grass and dirt sit at H~30 V~139.
+# The notebook's [20,60,80] floor lets the shoulder through, and "widest run per row"
+# then locks onto grass instead of the line.
+YELLOW_LOWER = np.array([18, 80, 170])
+YELLOW_UPPER = np.array([42, 255, 255])
+
+ROAD_TOP = 50               # first row below the horizon
+MIN_ROWS = 6                # fewer rows than this and the line is too short to trust
+MAX_RESID = 4.0             # px RMS; a worse fit means the tracker wandered off the line
 SEG_WIDTH = 4               # drawn line thickness in source pixels
-MAX_RESID = 6.0             # px; a worse polynomial fit means the tracker wandered
 
 
 def yellow_points(bgr):
-    """Track the yellow centre line in bird's-eye space; returns source-space points."""
-    warped = cv2.warpPerspective(bgr, M, (WARP_W, WARP_H))
-    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-    mask = cv2.medianBlur(cv2.inRange(hsv, YELLOW_LOWER, YELLOW_UPPER), 5)
+    """Row-wise centroid of the yellow centre line, fitted and resampled.
 
-    col = mask[WARP_H // 2:, :].sum(axis=0)
-    if col.max() < 255 * 3:
+    Works directly in image space. The bird's-eye warp the notebook uses is tuned
+    for a different tub: on this one it pushes the line outside the warp quad on
+    ~21% of frames, which shows up as an empty mask even though the line is plainly
+    visible in the source.
+    """
+    mask = cv2.medianBlur(cv2.inRange(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV),
+                                      YELLOW_LOWER, YELLOW_UPPER), 3)
+    xs, ys = [], []
+    for y in range(ROAD_TOP, FRAME_H):
+        idx = np.flatnonzero(mask[y] > 0)
+        if idx.size == 0:
+            continue
+        runs = np.split(idx, np.flatnonzero(np.diff(idx) > 3) + 1)
+        widest = max(runs, key=len)
+        xs.append(widest.mean()); ys.append(y)
+
+    if len(xs) < MIN_ROWS:
         return None
-    base, xs, ys = int(np.argmax(col)), [], []
-
-    y = WARP_H
-    for _ in range(N_WINDOWS):
-        y0, y1 = max(0, y - WIN_H), y
-        if y0 >= y1:
-            break
-        x0, x1 = max(0, base - WIN_MARGIN), min(WARP_W, base + WIN_MARGIN)
-        cs, _ = cv2.findContours(mask[y0:y1, x0:x1], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cs:
-            m = cv2.moments(max(cs, key=cv2.contourArea))
-            if m["m00"]:
-                base = x0 + int(m["m10"] / m["m00"])
-                xs.append(base); ys.append((y0 + y1) // 2)
-        y -= WIN_H
-
-    if len(xs) < MIN_POINTS:
-        return None
-
-    # Fit in bird's-eye space, where the line is close to straight, then sample densely.
-    # Joining the raw window centroids leaves kinks, and stops at whichever window last
-    # found something rather than spanning the visible line.
     xs, ys = np.array(xs, float), np.array(ys, float)
     fit = np.polyfit(ys, xs, 2 if len(xs) >= 5 else 1)
     if np.sqrt(np.mean((np.polyval(fit, ys) - xs) ** 2)) > MAX_RESID:
         return None
 
-    yy = np.linspace(ys.min(), min(ys.max() + WIN_H, WARP_H), 40)
-    pts = cv2.perspectiveTransform(
-        np.float32([[[x, y]] for x, y in zip(np.polyval(fit, yy), yy)]), M_INV).reshape(-1, 2)
-    pts = pts[(pts[:, 0] > -FRAME_W) & (pts[:, 0] < 2 * FRAME_W)
-              & (pts[:, 1] >= 0) & (pts[:, 1] < FRAME_H)]
-    return pts if len(pts) >= 5 else None
+    yy = np.arange(ys.min(), FRAME_H)                 # extend the fit down to the bumper
+    pts = np.stack([np.polyval(fit, yy), yy], axis=1)
+    return pts[(pts[:, 0] >= 0) & (pts[:, 0] < FRAME_W)]
 
 
 def draw_mask(pts):
@@ -130,13 +118,34 @@ def main():
         row = telem.get(p.name)
         if row:
             by_ep[row["episode_id"]].append(p)
-    # Hold out whole episodes, smallest first, so the bulk of the data stays in train.
-    eps = sorted(by_ep, key=lambda e: len(by_ep[e]))
-    test_eps = set(eps[:args.test_episodes])
-    val_eps = set(eps[args.test_episodes:args.test_episodes + args.val_episodes])
-    eps = sorted(by_ep, key=lambda e: -len(by_ep[e]))
-    split_of = lambda e: "test" if e in test_eps else "val" if e in val_eps else "train"
-    print("episodes ->", {e: split_of(e) for e in eps})
+    need = args.val_episodes + args.test_episodes + 1
+    if len(by_ep) >= need:
+        # Hold out whole episodes, smallest first, so the bulk stays in train.
+        order = sorted(by_ep, key=lambda e: len(by_ep[e]))
+        test_eps, val_eps = set(order[:args.test_episodes]), \
+                            set(order[args.test_episodes:args.test_episodes + args.val_episodes])
+        eps = sorted(by_ep, key=lambda e: -len(by_ep[e]))
+        split_of = lambda p, e: "test" if e in test_eps else "val" if e in val_eps else "train"
+        print("episodes ->", {e: split_of(None, e) for e in eps})
+    else:
+        # Too few episodes to hold one out. Split the timeline contiguously instead and
+        # drop GAP frames either side of each boundary: frames are ~50ms apart, so
+        # neighbours are near-duplicates and would leak across the split.
+        eps = sorted(by_ep)
+        ordered = [p for e in eps for p in sorted(by_ep[e])]
+        n = len(ordered)
+        i_val, i_test = int(n * 0.70), int(n * 0.85)
+        GAP = 15
+        pos = {p: i for i, p in enumerate(ordered)}
+
+        def split_of(p, e):
+            i = pos[p]
+            if abs(i - i_val) < GAP or abs(i - i_test) < GAP:
+                return None                      # boundary buffer, discarded
+            return "train" if i < i_val else "val" if i < i_test else "test"
+
+        print(f"{len(by_ep)} episode(s) -- contiguous 70/15/15 split of {n} frames, "
+              f"{GAP}-frame buffer at each boundary")
 
     (dest / "seg_label" / "list").mkdir(parents=True, exist_ok=True)
     lists, kept, dropped = defaultdict(list), 0, 0
@@ -156,7 +165,11 @@ def main():
             if not (dest / rel_img).exists():
                 shutil.copyfile(p, dest / rel_img)
             cv2.imwrite(str(dest / rel_seg), draw_mask(pts))
-            lists[split_of(ep)].append(f"/{rel_img} /{rel_seg} 1 0 0 0")
+            split = split_of(p, ep)
+            if split is None:
+                dropped += 1
+                continue
+            lists[split].append(f"/{rel_img} /{rel_seg} 1 0 0 0")
             kept += 1
 
     for split, rows in lists.items():
