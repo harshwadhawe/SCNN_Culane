@@ -10,6 +10,11 @@ __pycache__/
 # executed notebooks pulled back from Colab
 run/*
 
+# donkeycar-style tub captures
+tub_generated_track/
+tub_generated_track.zip
+tub_*/
+
 # dataset trees (fetched by download_tusimple.py / download_culane.py)
 toy_data/
 TUSimple/
