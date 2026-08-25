@@ -271,9 +271,18 @@ def main():
 
     it = start_epoch * iters_per_epoch
     t_start = time.time()
-    csv = open(args.exp_dir / "history.csv", "a", buffering=1)
+    # Appending across runs is what makes --resume produce one continuous history, but a
+    # file written by an older column set would leave two schemas in one CSV and no parser
+    # can read that. Set it aside instead of appending to it or silently overwriting.
+    csv_path = args.exp_dir / "history.csv"
+    HEADER = "epoch,iter,train_loss,train_seg,train_exist,val_loss,lr,elapsed_s\n"
+    if csv_path.exists() and csv_path.stat().st_size and not csv_path.read_text().startswith(HEADER):
+        stale = csv_path.with_name("history.old.csv")
+        csv_path.rename(stale)
+        log(f"history.csv had different columns; moved to {stale.name}")
+    csv = open(csv_path, "a", buffering=1)
     if csv.tell() == 0:
-        csv.write("epoch,iter,train_loss,train_seg,train_exist,val_loss,lr,elapsed_s\n")
+        csv.write(HEADER)
 
     for epoch in range(start_epoch, epochs):
         net.train()
