@@ -90,6 +90,55 @@ def normalise(staging: Path, dest: Path):
                 break
 
 
+def link_from(src: Path, dest: Path):
+    """Build the expected tree out of symlinks into a read-only source.
+
+    Kaggle mounts datasets at /kaggle/input read-only, so nothing can be moved or
+    written there -- but dataset/Tusimple.py writes seg_label/ into the dataset root.
+    Symlinking each clip directory gives a writable root without copying the images.
+    Links are per-clip rather than per-date because train_set and test_set both
+    contain 0531 and 0601.
+    """
+    (dest / "clips").mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for clips in sorted(src.rglob("clips")):
+        if not clips.is_dir():
+            continue
+        for date_dir in sorted(d for d in clips.iterdir() if d.is_dir()):
+            out_date = dest / "clips" / date_dir.name
+            out_date.mkdir(parents=True, exist_ok=True)
+            for clip in date_dir.iterdir():
+                target = out_date / clip.name
+                if not target.exists():
+                    target.symlink_to(clip.resolve())
+                    linked += 1
+        print(f"  linked {clips.relative_to(src)}")
+    for name in LABELS[:3]:
+        found = next(src.rglob(name), None)
+        if found is not None and not (dest / name).exists():
+            shutil.copyfile(found, dest / name)
+            print(f"  copied {name}")
+    if not (dest / "test_label.json").exists():
+        for alias in TEST_ALIASES:
+            found = next(src.rglob(alias), None)
+            if found is not None:
+                shutil.copyfile(found, dest / "test_label.json")
+                print(f"  copied {found.name} -> test_label.json")
+                break
+    print(f"  {linked} clip directories linked")
+
+
+def count_frames(dest: Path) -> int:
+    """Frames the labels actually reference. rglob("20.jpg") would undercount to zero
+    on a symlinked tree, since Path.rglob does not descend into symlinked directories."""
+    n = 0
+    for name in LABELS:
+        path = dest / name
+        if path.exists():
+            n += sum(1 for l in path.read_text().splitlines() if l.strip())
+    return n
+
+
 def verify(dest: Path) -> bool:
     """Every raw_file a label references must exist. This is what catches bad mirrors."""
     ok = True
@@ -115,6 +164,9 @@ def main():
     ap.add_argument("--from-zip", nargs="*", type=Path, default=None,
                     help="use these local zips instead of downloading from Kaggle")
     ap.add_argument("--verify-only", action="store_true")
+    ap.add_argument("--link-from", type=Path, default=None,
+                    help="build the tree as symlinks into a read-only source "
+                         "(Kaggle's /kaggle/input); --dest must be writable")
     ap.add_argument("--arrange", action="store_true",
                     help="flatten an already-extracted tree in place (Kaggle nests the data "
                          "under train_set/ and test_set/; the repo needs one clips/ at the root)")
@@ -146,6 +198,17 @@ def main():
                 print(f"  test label: {hit.relative_to(dest)}")
         sys.exit(0)
 
+    if args.link_from is not None:
+        src = args.link_from.expanduser().resolve()
+        print(f"linking {src} -> {dest}")
+        link_from(src, dest)
+        print("verifying")
+        ok = verify(dest)
+        if ok:
+            print(f"\nready: {count_frames(dest)} labelled frames linked under {dest}")
+            print(f"train with:\n  python scnn_tusimple.py --data {dest}")
+        sys.exit(0 if ok else 1)
+
     if args.arrange:
         print(f"arranging {dest} in place")
         normalise(dest, dest)
@@ -162,8 +225,7 @@ def main():
         print("verifying")
         ok = verify(dest)
         if ok:
-            n = sum(1 for _ in (dest / "clips").rglob("20.jpg"))
-            print(f"\nready: {n} labelled frames under {dest}")
+            print(f"\nready: {count_frames(dest)} labelled frames under {dest}")
         sys.exit(0 if ok else 1)
 
     if args.test_label is not None:
@@ -203,8 +265,7 @@ def main():
         shutil.rmtree(staging, ignore_errors=True)
 
     if ok:
-        n = sum(1 for _ in (dest / "clips").rglob("20.jpg"))
-        print(f"\nready: {n} labelled frames under {dest}")
+        print(f"\nready: {count_frames(dest)} labelled frames under {dest}")
         print(f"train with:\n  python scnn_tusimple.py --data {dest}")
     else:
         print("\nincomplete — see the BAD/MISSING lines above")
