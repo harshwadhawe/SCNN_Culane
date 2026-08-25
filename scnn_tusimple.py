@@ -84,11 +84,12 @@ def describe(device):
 def autoscale_batch(device, resize, amp):
     """Fit the batch to VRAM.
 
-    Calibrated against an RTX 4060 (7799 MiB): batch 26 at 512x288 with autocast
-    OOMs, implying ~287 MB per image. Autocast saves roughly 30% over fp32 rather
-    than half -- fp32 master weights and cuDNN workspace do not shrink. Scale
-    linearly with pixel count and keep headroom for context, weights, SGD momentum
-    and cudnn.benchmark's algorithm search.
+    Calibrated against an RTX 4060 (7799 MiB) at 512x288: batch 26 with autocast
+    OOMs (~287 MB/image), and batch 13 in fp32 leaves only 304 MB free (~520
+    MB/image). Autocast saves roughly 30% rather than half -- fp32 master weights
+    and cuDNN workspace do not shrink. Scale linearly with pixel count and keep
+    headroom for context, weights, SGD momentum and cudnn.benchmark's algorithm
+    search, which probes several large scratch buffers on the first iterations.
     """
     if device.type != "cuda":
         return 4
@@ -97,7 +98,7 @@ def autoscale_batch(device, resize, amp):
     # has to come off the top or every estimate overcommits.
     free_mb = torch.cuda.mem_get_info(0)[0] / 2**20
     px_ratio = (resize[0] * resize[1]) / (512 * 288)
-    per_img = (300 if amp else 430) * px_ratio
+    per_img = (300 if amp else 520) * px_ratio
     usable = free_mb * 0.85 - 800            # context + weights + optimizer + cudnn workspace
     return int(max(2, min(32, usable // per_img)))
 
@@ -321,13 +322,13 @@ def main():
             run += loss.item(); run_seg += l_seg.mean().item()
             run_exist += l_exist.mean().item(); seen += 1; it += 1
             if i % args.log_every == 0:
-                done = it / max(args.max_iter, 1)
+                done = min(it / max(args.max_iter, 1), 1.0)
                 eta = (time.time() - t_start) / max(done, 1e-9) * (1 - done)
                 log(f"ep {epoch}/{epochs-1} it {it}/{args.max_iter} "
                     f"loss {run/seen:.4f} (seg {run_seg/seen:.4f} exist {run_exist/seen:.4f}) "
                     f"lr {optimizer.param_groups[0]['lr']:.5f} eta {eta/60:.0f}m")
-            if stop_requested:
-                break
+            if it >= args.max_iter or stop_requested:
+                break        # epochs is a ceiling; max_iter is the real stopping point
 
         n = max(seen, 1)
         train_loss, train_seg, train_exist = run / n, run_seg / n, run_exist / n
@@ -347,6 +348,8 @@ def main():
             log("stopping early on signal; checkpoint written, rerun with --resume")
             csv.close()
             return
+        if it >= args.max_iter:
+            break
 
     csv.close()
     log(f"training finished in {(time.time()-t_start)/60:.1f} min, best val {best_val:.4f}")
