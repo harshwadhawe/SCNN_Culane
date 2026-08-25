@@ -50,10 +50,17 @@ ROAD_TOP = 50               # first row below the horizon
 MIN_ROWS = 6                # fewer rows than this and the line is too short to trust
 MAX_RESID = 4.0             # px RMS; a worse fit means the tracker wandered off the line
 SEG_WIDTH = 4               # drawn line thickness in source pixels
+
+# An edge line is a long, clearly separated marking. Road glare passes the residual
+# test happily -- it is smooth -- but shows up as a short stub close to the centre
+# line, so gate edges on span and separation rather than on fit quality.
+EDGE_MIN_ROWS = 10          # of the 70 road rows
+EDGE_MIN_SPAN = 20          # rows from top to bottom of the fitted edge
+EDGE_MIN_GAP = 8            # px clear of the centre line
 LANE_NAMES = ("white_left", "yellow", "white_right")     # segmentation classes 1, 2, 3
 
 
-def _fit_rows(mask, pick):
+def _fit_rows(mask, pick, min_rows=None):
     """Per-row pick -> polynomial fit -> resampled points, or None."""
     xs, ys = [], []
     for y in range(ROAD_TOP, FRAME_H):
@@ -66,7 +73,7 @@ def _fit_rows(mask, pick):
             continue
         xs.append(run.mean()); ys.append(y)
 
-    if len(xs) < MIN_ROWS:
+    if len(xs) < (MIN_ROWS if min_rows is None else min_rows):
         return None
     xs, ys = np.array(xs, float), np.array(ys, float)
     fit = np.polyfit(ys, xs, 2 if len(xs) >= 5 else 1)
@@ -103,23 +110,26 @@ def extract_lanes(bgr):
                 return None
             side = [r for r in runs if (r.mean() - cx) * sign > 4]
             return max(side, key=len) if side else None
-        pts = _fit_rows(wmask, pick)
-        if pts is not None and _stays_on_side(pts, centre, sign):
+        pts = _fit_rows(wmask, pick, min_rows=EDGE_MIN_ROWS)
+        if pts is not None and _is_edge(pts, centre, sign):
             lanes[name] = pts
     return lanes
 
 
-def _stays_on_side(pts, centre, sign, min_gap=3.0, tolerance=0.9):
-    """Reject an edge that crosses the centre line -- real markings never do.
+def _is_edge(pts, centre, sign, tolerance=0.9):
+    """Is this a real edge line, or road glare the per-row pick wandered onto?
 
-    The per-row pick only sees one row at a time, so where there is no edge on that
-    side it will happily follow road glare, and a smooth wrong curve passes the
-    residual test. Checking the fitted curve against the centre line catches it.
+    Three things separate them. It must not cross the centre line -- real markings
+    never do. It must span a decent slice of the road rather than being a stub. And
+    it must stay clear of the centre line, since glare tends to get picked up just
+    beside it. Fit quality does not separate them: glare is smooth.
     """
-    shared = [(x, centre[int(y)]) for x, y in pts if int(y) in centre]
-    if len(shared) < MIN_ROWS:
+    if pts[:, 1].max() - pts[:, 1].min() < EDGE_MIN_SPAN:
         return False
-    ok = sum(1 for x, cx in shared if (x - cx) * sign >= min_gap)
+    shared = [(x, centre[int(y)]) for x, y in pts if int(y) in centre]
+    if len(shared) < EDGE_MIN_ROWS:
+        return False
+    ok = sum(1 for x, cx in shared if (x - cx) * sign >= EDGE_MIN_GAP)
     return ok / len(shared) >= tolerance
 
 
