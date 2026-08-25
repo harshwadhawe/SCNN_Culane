@@ -26,7 +26,11 @@ class SCNN(nn.Module):
         self.scale_exist = 0.1
 
         self.ce_loss = nn.CrossEntropyLoss(weight=torch.tensor([self.scale_background, 1, 1, 1, 1]))
-        self.bce_loss = nn.BCELoss()
+        # BCEWithLogits, not BCELoss on the sigmoid output: it folds the sigmoid in via
+        # log-sum-exp, so a saturated unit gives a finite gradient instead of log(0).
+        # BCELoss also asserts its input lies in [0, 1], which turns any NaN upstream into
+        # an unrecoverable device-side assert rather than a NaN we can catch.
+        self.bce_loss = nn.BCEWithLogitsLoss()
 
     def forward(self, img, seg_gt=None, exist_gt=None):
         x = self.backbone(img)
@@ -37,16 +41,19 @@ class SCNN(nn.Module):
         seg_pred = F.interpolate(x, scale_factor=8, mode='bilinear', align_corners=True)
         x = self.layer3(x)
         x = x.view(-1, self.fc_input_feature)
-        exist_pred = self.fc(x)
+        exist_logit = self.fc[:-1](x)          # everything but the trailing Sigmoid
+        exist_pred = torch.sigmoid(exist_logit)  # callers threshold this at 0.5, unchanged
 
         if seg_gt is not None and exist_gt is not None:
             # self.fc already applies Sigmoid, so this is BCELoss-on-probabilities, which
             # CUDA autocast refuses ("unsafe to autocast"). Cross-entropy on fp16 logits is
             # also less stable. Compute both in fp32 with autocast explicitly off -- a no-op
             # when autocast was never enabled, so the fp32 path is bit-identical.
+            # Losses in fp32 with autocast off: cross-entropy on fp16 logits is less
+            # stable, and this is a no-op when autocast was never enabled.
             with torch.autocast(device_type=img.device.type, enabled=False):
                 loss_seg = self.ce_loss(seg_pred.float(), seg_gt)
-                loss_exist = self.bce_loss(exist_pred.float(), exist_gt.float())
+                loss_exist = self.bce_loss(exist_logit.float(), exist_gt.float())
                 loss = loss_seg * self.scale_seg + loss_exist * self.scale_exist
         else:
             loss_seg = torch.tensor(0, dtype=img.dtype, device=img.device)

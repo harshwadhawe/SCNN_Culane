@@ -44,7 +44,10 @@ def parse_args():
     p.add_argument("--max-iter", type=int, default=1500, help="exp0 reference; PolyLR counts iterations")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--workers", type=int, default=None)
-    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False,
+                   help="off by default: SCNN's message passing accumulates over 36-64 "
+                        "sequential steps and overflows fp16. Ampere and later already get "
+                        "tensor cores through TF32, without the range loss.")
     p.add_argument("--log-every", type=int, default=20, help="iterations between progress lines")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval-only", action="store_true", help="skip training, score the best checkpoint")
@@ -56,6 +59,10 @@ def pick_device():
     if torch.cuda.is_available():
         # input size is fixed all run, so let cuDNN pick algorithms once and reuse them
         torch.backends.cudnn.benchmark = True
+        # TF32 gives tensor-core throughput at fp32 range on Ampere+ -- most of AMP's
+        # speed with none of fp16's overflow risk
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
@@ -195,12 +202,9 @@ def main():
 
     # hardware-dependent defaults, all in one place
     if args.batch_size is None:
-        args.batch_size = autoscale_batch(device, tuple(args.resize),
-                                          is_cuda if args.amp is None else args.amp)
+        args.batch_size = autoscale_batch(device, tuple(args.resize), args.amp)
     if args.workers is None:
         args.workers = 8 if is_cuda else 0
-    if args.amp is None:
-        args.amp = is_cuda
     args.pin_memory = is_cuda
     if args.lr is None:
         # exp0 used lr 0.15 at batch 32; linear scaling keeps the step size sane elsewhere
@@ -213,7 +217,8 @@ def main():
     log = Log(args.exp_dir / "train.log")
     log("=" * 72)
     log(describe(device))
-    log(f"batch {args.batch_size} | lr {args.lr:.4f} | amp {args.amp} | workers {args.workers}")
+    log(f"batch {args.batch_size} | lr {args.lr:.4f} | amp {args.amp}"
+        + (" (tf32 on)" if is_cuda and not args.amp else "") + f" | workers {args.workers}")
     log(f"resize {tuple(args.resize)} | max_iter {args.max_iter} | exp_dir {args.exp_dir}")
     (args.exp_dir / "cfg.json").write_text(json.dumps(
         {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}, indent=2))
