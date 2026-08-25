@@ -273,11 +273,12 @@ def main():
     t_start = time.time()
     csv = open(args.exp_dir / "history.csv", "a", buffering=1)
     if csv.tell() == 0:
-        csv.write("epoch,iter,train_loss,val_loss,lr,elapsed_s\n")
+        csv.write("epoch,iter,train_loss,train_seg,train_exist,val_loss,lr,elapsed_s\n")
 
     for epoch in range(start_epoch, epochs):
         net.train()
-        run, seen = 0.0, 0
+        run = run_seg = run_exist = 0.0
+        seen = 0
         t_epoch = time.time()
 
         for i, s in enumerate(train_loader):
@@ -287,7 +288,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             try:
                 with torch.autocast(device.type, enabled=args.amp):
-                    loss = net(img, seg, ex)[4]
+                    _, _, l_seg, l_exist, loss = net(img, seg, ex)
                 if loss.dim():                   # DataParallel returns one loss per shard
                     loss = loss.sum()
                 scaler.scale(loss).backward()
@@ -308,21 +309,24 @@ def main():
                     f"latest.pth still holds epoch {epoch-1}.")
                 sys.exit(3)
 
-            run += loss.item(); seen += 1; it += 1
+            run += loss.item(); run_seg += l_seg.mean().item()
+            run_exist += l_exist.mean().item(); seen += 1; it += 1
             if i % args.log_every == 0:
                 done = it / max(args.max_iter, 1)
                 eta = (time.time() - t_start) / max(done, 1e-9) * (1 - done)
                 log(f"ep {epoch}/{epochs-1} it {it}/{args.max_iter} "
-                    f"loss {run/seen:.4f} lr {optimizer.param_groups[0]['lr']:.5f} "
-                    f"eta {eta/60:.0f}m")
+                    f"loss {run/seen:.4f} (seg {run_seg/seen:.4f} exist {run_exist/seen:.4f}) "
+                    f"lr {optimizer.param_groups[0]['lr']:.5f} eta {eta/60:.0f}m")
             if stop_requested:
                 break
 
-        train_loss = run / max(seen, 1)
+        n = max(seen, 1)
+        train_loss, train_seg, train_exist = run / n, run_seg / n, run_exist / n
         val_loss = validate(net, val_loader, device, args.amp)
-        log(f"epoch {epoch} done in {time.time()-t_epoch:.0f}s | train {train_loss:.4f} | val {val_loss:.4f}")
-        csv.write(f"{epoch},{it},{train_loss:.6f},{val_loss:.6f},"
-                  f"{optimizer.param_groups[0]['lr']:.8f},{time.time()-t_start:.0f}\n")
+        log(f"epoch {epoch} done in {time.time()-t_epoch:.0f}s | train {train_loss:.4f} "
+            f"(seg {train_seg:.4f} exist {train_exist:.4f}) | val {val_loss:.4f}")
+        csv.write(f"{epoch},{it},{train_loss:.6f},{train_seg:.6f},{train_exist:.6f},"
+                  f"{val_loss:.6f},{optimizer.param_groups[0]['lr']:.8f},{time.time()-t_start:.0f}\n")
 
         save(latest, core, optimizer, sched, scaler, epoch, best_val)
         if val_loss < best_val:
